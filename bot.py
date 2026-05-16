@@ -8,6 +8,9 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
+import aiohttp
+from bs4 import BeautifulSoup
+
 # ── Config ──────────────────────────────────────────────────────────────────
 PREFIX = "!"
 DB_FILE = "/app/data/db.json"
@@ -45,6 +48,10 @@ GAME_CHOICES = [
     for k, v in GAMES.items()
 ]
 
+WIIMMFI_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
 # ── Database helpers ─────────────────────────────────────────────────────────
 db_lock = asyncio.Lock()
 
@@ -56,6 +63,7 @@ def load_db() -> dict:
 
 async def save_db(data: dict):
     async with db_lock:
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
@@ -69,6 +77,64 @@ def get_or_create_profile(db: dict, user_id: str, user: discord.User | discord.M
             "registered_at": datetime.utcnow().strftime("%d/%m/%Y %H:%M UTC"),
         }
     return db[user_id]
+
+# ── Wiimmfi scraper ──────────────────────────────────────────────────────────
+async def fetch_online_players(url: str) -> list[dict]:
+    """
+    Scrape a Wiimmfi game page and return a list of online players.
+    Each entry: {"fc": "XXXX-XXXX-XXXX", "name": str, "status": str}
+    Returns [] on error.
+    """
+    try:
+        async with aiohttp.ClientSession(headers=WIIMMFI_HEADERS) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return []
+                html = await resp.text()
+
+        soup = BeautifulSoup(html, "html.parser")
+        players = []
+
+        # Wiimmfi player tables have class "rl" or are inside a section with online players
+        # Each row contains: profile name, FC, status, etc.
+        for table in soup.find_all("table"):
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                # Try to find a Friend Code pattern in any cell
+                for cell in cells:
+                    text = cell.get_text(strip=True)
+                    fc_match = re.search(r"\d{4}-\d{4}-\d{4}", text)
+                    if fc_match:
+                        fc = fc_match.group(0)
+                        # Player name is usually in the first cell
+                        name = cells[0].get_text(strip=True)
+                        status = cells[-1].get_text(strip=True) if len(cells) > 1 else "?"
+                        players.append({"fc": fc, "name": name, "status": status})
+                        break
+
+        return players
+
+    except Exception:
+        return []
+
+def build_fc_index(db: dict) -> dict[str, dict]:
+    """
+    Build a reverse index: fc -> {user_id, player_name, school_name, game_key}
+    for fast lookup when matching Wiimmfi results.
+    """
+    index = {}
+    for user_id, profile in db.items():
+        for game_key, fc in profile.get("friend_codes", {}).items():
+            index[fc] = {
+                "user_id": user_id,
+                "player_name": profile.get("player_name") or "?",
+                "school_name": profile.get("school_name") or "?",
+                "username": profile.get("username", "?"),
+                "game_key": game_key,
+            }
+    return index
 
 # ── Embed builders ───────────────────────────────────────────────────────────
 def build_profile_embed(user: discord.User | discord.Member, profile: dict) -> discord.Embed:
@@ -137,6 +203,61 @@ def build_list_embed(db: dict, guild: discord.Guild) -> discord.Embed:
         embed.description = "No players registered yet."
     return embed
 
+async def build_wiimmfi_embed(db: dict, guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🌐 Magician's Quest — Who's Online?",
+        color=0x7B4FBF,
+        description="Fetching live data from Wiimmfi...",
+    )
+
+    fc_index = build_fc_index(db)
+    total_online = 0
+
+    for key, game in GAMES.items():
+        if not game["wiimmfi"]:
+            embed.add_field(
+                name=f"{game['emoji']} {game['short']} — {game['name']}",
+                value="*(3DS — no Wiimmfi support)*",
+                inline=False,
+            )
+            continue
+
+        players = await fetch_online_players(game["wiimmfi"])
+
+        if not players:
+            embed.add_field(
+                name=f"{game['emoji']} {game['short']} — {game['name']}",
+                value="🔴 No one online — or Wiimmfi unreachable",
+                inline=False,
+            )
+            continue
+
+        total_online += len(players)
+        lines = []
+        for p in players:
+            registered = fc_index.get(p["fc"])
+            if registered:
+                # Known player — show Discord info
+                member = guild.get_member(int(registered["user_id"]))
+                mention = member.mention if member else registered["username"]
+                lines.append(
+                    f"🟢 **{p['name']}** (`{p['fc']}`) — {mention} "
+                    f"*({registered['player_name']}, {registered['school_name']})*"
+                )
+            else:
+                # Unknown player
+                lines.append(f"⚪ **{p['name']}** (`{p['fc']}`)")
+
+        embed.add_field(
+            name=f"{game['emoji']} {game['short']} — {game['name']} ({len(players)} online)",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    embed.description = f"**{total_online}** player(s) currently online across all games."
+    embed.set_footer(text=f"🟢 = registered in this server  ⚪ = unknown player  •  {datetime.utcnow().strftime('%H:%M UTC')}")
+    return embed
+
 # ── Validation ───────────────────────────────────────────────────────────────
 def validate_fc(fc: str) -> bool:
     return bool(FC_REGEX.match(fc.strip()))
@@ -163,10 +284,7 @@ async def on_ready():
 # ── /setprofile ──────────────────────────────────────────────────────────────
 
 @tree.command(name="setprofile", description="Set your player name and school name.")
-@app_commands.describe(
-    player_name="Your in-game player name",
-    school_name="Your school name",
-)
+@app_commands.describe(player_name="Your in-game player name", school_name="Your school name")
 async def slash_setprofile(interaction: discord.Interaction, player_name: str, school_name: str):
     db = load_db()
     profile = get_or_create_profile(db, str(interaction.user.id), interaction.user)
@@ -196,10 +314,7 @@ async def prefix_setprofile(ctx: commands.Context, player_name: str = None, scho
 # ── /addfc ───────────────────────────────────────────────────────────────────
 
 @tree.command(name="addfc", description="Add your Friend Code for a specific game.")
-@app_commands.describe(
-    game="The game you want to register a Friend Code for",
-    fc="Your Friend Code (format: XXXX-XXXX-XXXX)",
-)
+@app_commands.describe(game="The game you want to register a Friend Code for", fc="Your Friend Code (XXXX-XXXX-XXXX)")
 @app_commands.choices(game=GAME_CHOICES)
 async def slash_addfc(interaction: discord.Interaction, game: app_commands.Choice[str], fc: str):
     fc = format_fc(fc)
@@ -219,13 +334,11 @@ async def slash_addfc(interaction: discord.Interaction, game: app_commands.Choic
 @bot.command(name="addfc", help="Add a Friend Code for a game. Ex: !addfc mq1 1234-5678-9012")
 async def prefix_addfc(ctx: commands.Context, game: str = None, fc: str = None):
     if not game or not fc:
-        games_list = ", ".join(f"`{k}`" for k in GAMES)
-        await ctx.reply(f"❌ Usage: `!addfc <game> <XXXX-XXXX-XXXX>`\nGames: {games_list}")
+        await ctx.reply(f"❌ Usage: `!addfc <game> <XXXX-XXXX-XXXX>`\nGames: {', '.join(f'`{k}`' for k in GAMES)}")
         return
     game = game.lower()
     if game not in GAMES:
-        games_list = ", ".join(f"`{k}`" for k in GAMES)
-        await ctx.reply(f"❌ Unknown game. Available: {games_list}")
+        await ctx.reply(f"❌ Unknown game. Available: {', '.join(f'`{k}`' for k in GAMES)}")
         return
     fc = format_fc(fc)
     if not validate_fc(fc):
@@ -236,8 +349,7 @@ async def prefix_addfc(ctx: commands.Context, game: str = None, fc: str = None):
     profile["friend_codes"][game] = fc
     db[str(ctx.author.id)] = profile
     await save_db(db)
-    game_info = GAMES[game]
-    await ctx.reply(f"✅ Friend Code `{fc}` registered for **{game_info['short']} — {game_info['name']}**!")
+    await ctx.reply(f"✅ Friend Code `{fc}` registered for **{GAMES[game]['short']} — {GAMES[game]['name']}**!")
 
 # ── /profile ─────────────────────────────────────────────────────────────────
 
@@ -304,13 +416,11 @@ async def slash_removefc(interaction: discord.Interaction, game: app_commands.Ch
 @bot.command(name="removefc", help="Remove your Friend Code for a game. Ex: !removefc mq1")
 async def prefix_removefc(ctx: commands.Context, game: str = None):
     if not game:
-        games_list = ", ".join(f"`{k}`" for k in GAMES)
-        await ctx.reply(f"❌ Usage: `!removefc <game>`\nGames: {games_list}")
+        await ctx.reply(f"❌ Usage: `!removefc <game>`\nGames: {', '.join(f'`{k}`' for k in GAMES)}")
         return
     game = game.lower()
     if game not in GAMES:
-        games_list = ", ".join(f"`{k}`" for k in GAMES)
-        await ctx.reply(f"❌ Unknown game. Available: {games_list}")
+        await ctx.reply(f"❌ Unknown game. Available: {', '.join(f'`{k}`' for k in GAMES)}")
         return
     db = load_db()
     profile = db.get(str(ctx.author.id))
@@ -345,28 +455,18 @@ async def prefix_unregister(ctx: commands.Context):
 
 # ── /wiimmfi ─────────────────────────────────────────────────────────────────
 
-@tree.command(name="wiimmfi", description="Show all Wiimmfi online player links.")
+@tree.command(name="wiimmfi", description="Show who is currently playing online on Wiimmfi.")
 async def slash_wiimmfi(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🌐 Magician's Quest — Wiimmfi Online",
-        description="Check who is currently playing online:",
-        color=0x7B4FBF,
-    )
-    for key, game in GAMES.items():
-        value = f"[View online players]({game['wiimmfi']})" if game["wiimmfi"] else "*(3DS — no Wiimmfi support)*"
-        embed.add_field(name=f"{game['emoji']} {game['short']} — {game['name']}", value=value, inline=False)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.defer()
+    db = load_db()
+    embed = await build_wiimmfi_embed(db, interaction.guild)
+    await interaction.followup.send(embed=embed)
 
-@bot.command(name="wiimmfi", help="Show all Wiimmfi online player links.")
+@bot.command(name="wiimmfi", help="Show who is currently playing online on Wiimmfi.")
 async def prefix_wiimmfi(ctx: commands.Context):
-    embed = discord.Embed(
-        title="🌐 Magician's Quest — Wiimmfi Online",
-        description="Check who is currently playing online:",
-        color=0x7B4FBF,
-    )
-    for key, game in GAMES.items():
-        value = f"[View online players]({game['wiimmfi']})" if game["wiimmfi"] else "*(3DS — no Wiimmfi support)*"
-        embed.add_field(name=f"{game['emoji']} {game['short']} — {game['name']}", value=value, inline=False)
+    async with ctx.typing():
+        db = load_db()
+        embed = await build_wiimmfi_embed(db, ctx.guild)
     await ctx.reply(embed=embed)
 
 # ── Launch ────────────────────────────────────────────────────────────────────
