@@ -10,7 +10,7 @@ from typing import Optional
 
 # ── Config ──────────────────────────────────────────────────────────────────
 PREFIX = "!"
-DB_FILE = "db.json"
+DB_FILE = "/app/data/db.json"
 FC_REGEX = re.compile(r"^\d{4}-\d{4}-\d{4}$")
 
 GAMES = {
